@@ -1,0 +1,69 @@
+# Reusable scan template: generates an SBOM from the exact image digest and scans it with Grype.
+#
+# It never fails on findings and deliberately has no severity or "only fixed" inputs: it reports
+# everything, and the orchestrator applies the gates. A failed run means the pipeline is broken.
+name: scan-grype
+
+on:
+  workflow_call:
+    inputs:
+      task_id: { required: true, type: string }
+      sha: { required: true, type: string }
+      target_digest: { required: true, type: string }
+      target_ref: { required: true, type: string }
+      sbom-format: { required: false, type: string, default: cyclonedx-json }
+      # Pin these in production (e.g. v1.x.y). Empty installs the latest release.
+      syft-version: { required: false, type: string, default: "" }
+      grype-version: { required: false, type: string, default: "" }
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    env:
+      TARGET_REF: ${{ inputs.target_ref }}
+      TARGET_DIGEST: ${{ inputs.target_digest }}
+    steps:
+      - name: Target must be pinned to the built digest
+        run: |
+          case "$TARGET_REF" in
+            *@"$TARGET_DIGEST") echo "scanning $TARGET_REF" ;;
+            *) echo "::error::target_ref must end with @target_digest"; exit 1 ;;
+          esac
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install Syft and Grype
+        run: |
+          mkdir -p "$HOME/.local/bin"
+          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b "$HOME/.local/bin" ${{ inputs.syft-version }}
+          curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh | sh -s -- -b "$HOME/.local/bin" ${{ inputs.grype-version }}
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: SBOM from the image digest
+        run: |
+          syft version
+          syft "registry:$TARGET_REF" -o "${{ inputs.sbom-format }}=sbom.cdx.json"
+
+      - name: Scan (reports findings; never fails on them)
+        run: |
+          grype version
+          grype "sbom:sbom.cdx.json" -o json=grype.json -o sarif=grype.sarif
+          jq -n --arg digest "$TARGET_DIGEST" --arg ref "$TARGET_REF" '{digest: $digest, ref: $ref}' > target.json
+          jq -r '.matches | group_by(.vulnerability.severity) | map("\(.[0].vulnerability.severity): \(length)") | .[]' grype.json || true
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: scan-results
+          path: |
+            grype.json
+            grype.sarif
+            sbom.cdx.json
+            target.json
+          retention-days: 30

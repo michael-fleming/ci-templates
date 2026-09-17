@@ -1,0 +1,48 @@
+# Reusable test template for Node projects using the built-in test runner.
+# Uploads test-results: summary.json {tests_total, tests_failed, coverage_pct} and junit.xml.
+name: test-node
+
+on:
+  workflow_call:
+    inputs:
+      task_id: { required: true, type: string }
+      sha: { required: true, type: string }
+      node-version: { required: false, type: string, default: "22" }
+      hooks: { required: false, type: string, default: "" }
+      hooks-dir: { required: false, type: string, default: .orchestrator/hooks }
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.sha }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+      - run: npm ci --ignore-scripts
+      - name: pre-test hook
+        if: contains(format(',{0},', inputs.hooks), ',pre-test,')
+        run: bash "${{ inputs.hooks-dir }}/pre-test.sh"
+      - name: Test with coverage (results are reported, not enforced here)
+        run: |
+          node --test --experimental-test-coverage \
+            --test-reporter=junit --test-reporter-destination=junit.xml \
+            --test-reporter=lcov --test-reporter-destination=lcov.info \
+            --test-reporter=spec --test-reporter-destination=stdout || true
+          total=$(grep -c '<testcase' junit.xml || true)
+          failed=$(grep -c '<failure' junit.xml || true)
+          coverage=$(awk -F: '/^LF:/{lf+=$2} /^LH:/{lh+=$2} END{ if (lf>0) printf "%.1f", lh*100/lf; else print 0 }' lcov.info)
+          jq -n --argjson t "${total:-0}" --argjson f "${failed:-0}" --argjson c "${coverage:-0}" \
+            '{tests_total: $t, tests_failed: $f, coverage_pct: $c}' > summary.json
+          cat summary.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: |
+            summary.json
+            junit.xml
+          retention-days: 30
