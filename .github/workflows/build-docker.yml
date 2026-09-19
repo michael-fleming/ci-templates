@@ -1,5 +1,13 @@
-# Reusable build template: builds the exact commit, pushes to GHCR by digest, and uploads the
-# orchestrator build manifest (orchestrator-build-manifest/v1).
+# Reusable build template v2: builds the exact commit, pushes to GHCR by digest, and uploads both
+# the orchestrator build manifest (orchestrator-build-manifest/v1) and the build result
+# (orchestrator-build-result/v1).
+#
+# v2 CHANGE (spec 008): a build command that fails because the CODE is wrong no longer fails the
+# run. It is captured, reported as ok:false with the full log, and the job still succeeds, so the
+# orchestrator's build_ok gate sends the work back to the coder instead of paging a human. Setup
+# steps — checkout, login, buildx — still fail hard, because those are genuine pipeline faults
+# that rework cannot fix. v1 templates keep working: they report no result, build_ok is missing,
+# and a gate on a missing metric fails closed.
 name: build-docker
 
 on:
@@ -42,25 +50,65 @@ jobs:
         id: image
         run: echo "name=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
 
+      # Invoked directly rather than via docker/build-push-action so the combined output can be
+      # tee'd to a file. The action writes only to the job log, which cannot be attached to a
+      # finding, and the whole point of v2 is handing the coder the compiler output.
       - name: Build and push
         id: push
-        uses: docker/build-push-action@v6
+        continue-on-error: true
+        env:
+          IMAGE: ${{ steps.image.outputs.name }}
+          SHA: ${{ inputs.sha }}
+          TASK: ${{ inputs.task_id }}
+          DOCKERFILE: ${{ inputs.dockerfile }}
+          PLATFORMS: ${{ inputs.platforms }}
+        run: |
+          set -o pipefail
+          docker buildx build \
+            --file "$DOCKERFILE" \
+            --platform "$PLATFORMS" \
+            --tag "$IMAGE:sha-$SHA" \
+            --label "org.opencontainers.image.revision=$SHA" \
+            --label "dev.orchestrator.task=$TASK" \
+            --provenance=false \
+            --metadata-file metadata.json \
+            --push . 2>&1 | tee build.log
+          echo "digest=$(jq -r '."containerimage.digest" // empty' metadata.json)" >> "$GITHUB_OUTPUT"
+
+      # Always runs, so a failure is reported rather than lost. This is the artifact the
+      # orchestrator reads (spec 008): ok:false routes to rework, a failed RUN escalates.
+      - name: Report build result
+        if: always()
+        env:
+          OUTCOME: ${{ steps.push.outcome }}
+        run: |
+          mkdir -p build-result
+          if [ "$OUTCOME" = "success" ]; then ok=true; code=0; else ok=false; code=1; fi
+          jq -n --argjson ok "$ok" --argjson code "$code" \
+            '{contract:"orchestrator-build-result/v1", ok:$ok, exit_code:$code, step:"build"}' \
+            > build-result/build-result.json
+          cp build.log build-result/build.log 2>/dev/null || echo "(no build output captured)" > build-result/build.log
+
+      - uses: actions/upload-artifact@v4
+        if: always()
         with:
-          context: .
-          file: ${{ inputs.dockerfile }}
-          platforms: ${{ inputs.platforms }}
-          push: true
-          provenance: false
-          tags: ${{ steps.image.outputs.name }}:sha-${{ inputs.sha }}
-          labels: |
-            org.opencontainers.image.revision=${{ inputs.sha }}
-            dev.orchestrator.task=${{ inputs.task_id }}
+          name: build-result
+          path: build-result/
+          retention-days: 7
+
+      # Everything after this point only makes sense for a build that actually produced an image.
+      - name: Stop here if the build failed
+        if: steps.push.outcome != 'success'
+        run: |
+          echo "The build command failed; reported as orchestrator-build-result/v1 for rework."
+          exit 0
 
       - name: post-build hook
-        if: contains(format(',{0},', inputs.hooks), ',post-build,')
+        if: steps.push.outcome == 'success' && contains(format(',{0},', inputs.hooks), ',post-build,')
         run: bash "${{ inputs.hooks-dir }}/post-build.sh"
 
       - name: Write build manifest
+        if: steps.push.outcome == 'success'
         env:
           DIGEST: ${{ steps.push.outputs.digest }}
           IMAGE: ${{ steps.image.outputs.name }}
@@ -74,7 +122,11 @@ jobs:
           }' > build-manifest.json
           cat build-manifest.json
 
+      # Guarded like the manifest step itself: on a failed build there is no manifest to upload,
+      # and an unguarded upload would fail the job — re-introducing the escalation v2 exists to
+      # remove.
       - uses: actions/upload-artifact@v4
+        if: steps.push.outcome == 'success'
         with:
           name: build-manifest
           path: build-manifest.json
